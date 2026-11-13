@@ -108,14 +108,8 @@ func (s *CommentService) LoadMoreReplies(ctx context.Context, comment *Comment) 
 	comments := root.JSON.Data.Things.Comments
 	mores := root.JSON.Data.Things.Mores
 
-	for _, c := range comments {
-		comment.addCommentToReplies(c)
-	}
-
-	if len(mores) > 0 {
-		comment.Replies.More = mores[0]
-	} else {
-		comment.Replies.More = nil
+	if err := mergeMoreChildren(comment.PostID, comment.FullID, &comment.Replies.Comments, &comment.Replies.More, comments, mores); err != nil {
+		return resp, err
 	}
 
 	return resp, nil

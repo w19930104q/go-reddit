@@ -504,22 +504,10 @@ func (s *PostService) LoadMoreComments(ctx context.Context, pc *PostAndComments)
 	}
 
 	comments := root.JSON.Data.Things.Comments
-	for _, c := range comments {
-		pc.addCommentToTree(c)
-	}
-
-	noMore := true
-
 	mores := root.JSON.Data.Things.Mores
-	for _, m := range mores {
-		if strings.HasPrefix(m.ParentID, kindPost+"_") {
-			noMore = false
-		}
-		pc.addMoreToTree(m)
-	}
 
-	if noMore {
-		pc.More = nil
+	if err := mergeMoreChildren(pc.Post.FullID, pc.Post.FullID, &pc.Comments, &pc.More, comments, mores); err != nil {
+		return resp, err
 	}
 
 	return resp, nil

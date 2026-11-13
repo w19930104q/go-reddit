@@ -633,3 +633,177 @@ func (pc *PostAndComments) addMoreToTree(more *More) {
 		reply.addMoreToReplies(more)
 	}
 }
+
+// equalComments compares two comments by content, ignoring their replies.
+func equalComments(a, b *Comment) bool {
+	ca, cb := *a, *b
+	ca.Replies = Replies{}
+	cb.Replies = Replies{}
+
+	ja, err := json.Marshal(ca)
+	if err != nil {
+		return false
+	}
+	jb, err := json.Marshal(cb)
+	if err != nil {
+		return false
+	}
+	return string(ja) == string(jb)
+}
+
+// mergeChildIDs merges two lists of comment IDs, preserving
+// their order and removing duplicates.
+func mergeChildIDs(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	var merged []string
+	for _, ids := range [][]string{a, b} {
+		for _, id := range ids {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			merged = append(merged, id)
+		}
+	}
+	return merged
+}
+
+// mergeMoreChildren validates the comments and mores returned by the
+// api/morechildren endpoint against the comment tree rooted at rootID
+// (the full ID of a post or a comment) and, only if the entire response
+// is valid, merges it into the tree in one shot. If anything is invalid,
+// an error is returned and the tree and the more cursors are left untouched.
+//
+// postID is the full ID of the post the tree belongs to; comments belonging
+// to a different post are rejected. rootComments and rootMore point to the
+// root's comment list and "more" cursor so they can be updated in place.
+//
+// Comments can arrive in any parent/child order. Comments already present
+// in the tree (by full ID) with identical content, and duplicates within
+// the response, are treated as no-ops. Conflicting content, cross-post
+// comments, orphans and cycles are reported as errors. Existing siblings
+// keep their order; new siblings are appended in the order they first
+// appear in the response. Multiple mores for the same parent are merged
+// into one, their children concatenated in order and deduplicated.
+func mergeMoreChildren(postID, rootID string, rootComments *[]*Comment, rootMore **More, comments []*Comment, mores []*More) error {
+	// index the comments already in the tree.
+	existing := make(map[string]*Comment)
+	var index func(comments []*Comment)
+	index = func(comments []*Comment) {
+		for _, c := range comments {
+			if c == nil {
+				continue
+			}
+			existing[c.FullID] = c
+			index(c.Replies.Comments)
+		}
+	}
+	index(*rootComments)
+
+	// Dedupe the incoming comments, keeping the first occurrence of each.
+	// Comments matching a node already in the tree are mapped to that node
+	// so that children arriving later still attach to it.
+	incoming := make(map[string]*Comment, len(comments))
+	var fresh []*Comment
+	for _, c := range comments {
+		if c == nil {
+			continue
+		}
+		if c.PostID != "" && postID != "" && c.PostID != postID {
+			return fmt.Errorf("comment %s belongs to post %s, not %s", c.FullID, c.PostID, postID)
+		}
+		if prev, ok := incoming[c.FullID]; ok {
+			if !equalComments(prev, c) {
+				return fmt.Errorf("comment %s: conflicting content", c.FullID)
+			}
+			continue
+		}
+		if prev, ok := existing[c.FullID]; ok {
+			if !equalComments(prev, c) {
+				return fmt.Errorf("comment %s: conflicting content", c.FullID)
+			}
+			incoming[c.FullID] = prev
+			continue
+		}
+		incoming[c.FullID] = c
+		fresh = append(fresh, c)
+	}
+
+	parent := func(id string) (*Comment, bool) {
+		if c, ok := incoming[id]; ok {
+			return c, true
+		}
+		if c, ok := existing[id]; ok {
+			return c, true
+		}
+		return nil, false
+	}
+
+	// Every new comment's parent must be the root, a comment already in
+	// the tree, or another comment from the response.
+	freshIDs := make(map[string]bool, len(fresh))
+	for _, c := range fresh {
+		freshIDs[c.FullID] = true
+		if c.ParentID == rootID {
+			continue
+		}
+		if _, ok := parent(c.ParentID); !ok {
+			return fmt.Errorf("comment %s: parent %s not found in the comment tree", c.FullID, c.ParentID)
+		}
+	}
+
+	// Detect cycles among the new comments.
+	for _, c := range fresh {
+		seen := map[string]bool{c.FullID: true}
+		for p := c; freshIDs[p.ParentID]; {
+			p = incoming[p.ParentID]
+			if seen[p.FullID] {
+				return fmt.Errorf("comment %s: cycle detected in the comment tree", c.FullID)
+			}
+			seen[p.FullID] = true
+		}
+	}
+
+	// Merge the mores by parent, preserving the order of their children.
+	mergedMores := make(map[string]*More)
+	for _, m := range mores {
+		if m == nil {
+			continue
+		}
+		if m.ParentID != rootID {
+			if _, ok := parent(m.ParentID); !ok {
+				return fmt.Errorf("more %s: parent %s not found in the comment tree", m.FullID, m.ParentID)
+			}
+		}
+		if merged, ok := mergedMores[m.ParentID]; ok {
+			merged.Children = mergeChildIDs(merged.Children, m.Children)
+			continue
+		}
+		cp := *m
+		cp.Children = mergeChildIDs(nil, m.Children)
+		mergedMores[m.ParentID] = &cp
+	}
+
+	// The response is valid: merge it into the tree.
+	for _, c := range fresh {
+		if c.ParentID == rootID {
+			*rootComments = append(*rootComments, c)
+			continue
+		}
+		p, _ := parent(c.ParentID)
+		p.Replies.Comments = append(p.Replies.Comments, c)
+	}
+
+	// The root's more cursor is consumed by the call; it is replaced by
+	// the merged more for the root if the response contained one.
+	*rootMore = mergedMores[rootID]
+	for parentID, m := range mergedMores {
+		if parentID == rootID {
+			continue
+		}
+		p, _ := parent(parentID)
+		p.Replies.More = m
+	}
+
+	return nil
+}
